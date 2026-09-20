@@ -14,19 +14,27 @@ PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
 
 CREATE TABLE IF NOT EXISTS samples (
-    id                        TEXT PRIMARY KEY,
-    name                      TEXT NOT NULL,
-    freeze_threshold_c        REAL NOT NULL,
-    thaw_threshold_c          REAL NOT NULL,
-    min_allowed_c             REAL,
-    max_allowed_c             REAL,
-    max_freeze_thaw_cycles    INTEGER,
+    id                              TEXT PRIMARY KEY,
+    name                            TEXT NOT NULL,
+    freeze_threshold_c              REAL NOT NULL,
+    thaw_threshold_c                REAL NOT NULL,
+    min_allowed_c                   REAL,
+    max_allowed_c                   REAL,
+    max_freeze_thaw_cycles          INTEGER,
+    -- 低温/高温累计暴露剂量预算（°C·min）与最大可积分间隔（分钟）
+    cold_dose_budget_c_min          REAL,
+    heat_dose_budget_c_min          REAL,
+    max_integration_interval_minutes REAL,
     -- 以下为每次重算后刷新的派生缓存，便于直接查询当前状态
     current_state             TEXT NOT NULL DEFAULT 'thawed',
     active_freeze_event_time  TEXT,
     active_freeze_min_c       REAL,
     active_freeze_max_c       REAL,
     cycle_count               INTEGER NOT NULL DEFAULT 0,
+    -- 暴露剂量缓存：累计低温/高温剂量（°C·min）与缺口总时长（分钟）
+    cold_dose_c_min           REAL NOT NULL DEFAULT 0,
+    heat_dose_c_min           REAL NOT NULL DEFAULT 0,
+    exposure_gap_minutes      REAL NOT NULL DEFAULT 0,
     created_at                TEXT NOT NULL,
     updated_at                TEXT NOT NULL
 );
@@ -68,6 +76,10 @@ CREATE TABLE IF NOT EXISTS alerts (
     temperature_c  REAL,
     cycle_index    INTEGER,
     reading_id     INTEGER REFERENCES readings(id) ON DELETE CASCADE,
+    -- exposure_budget_exceeded 告警的方向（cold/heat）与跨越时剂量/预算
+    direction      TEXT,
+    dose_c_min     REAL,
+    budget_c_min   REAL,
     message        TEXT NOT NULL,
     acknowledged   INTEGER NOT NULL DEFAULT 0,
     dedup_key      TEXT NOT NULL UNIQUE,
@@ -97,14 +109,50 @@ def connect(db_path: str | None = None) -> sqlite3.Connection:
     return conn
 
 
+# 旧版本数据库的增量列：CREATE TABLE IF NOT EXISTS 不会为已存在的表补列，
+# 因此启动时检测缺失列并以 ALTER TABLE 平滑加列（SQLite >= 3.35 / 各旧版本均支持）。
+_MIGRATION_COLUMNS = {
+    "samples": {
+        "cold_dose_budget_c_min": "REAL",
+        "heat_dose_budget_c_min": "REAL",
+        "max_integration_interval_minutes": "REAL",
+        "cold_dose_c_min": "REAL NOT NULL DEFAULT 0",
+        "heat_dose_c_min": "REAL NOT NULL DEFAULT 0",
+        "exposure_gap_minutes": "REAL NOT NULL DEFAULT 0",
+    },
+    "alerts": {
+        "direction": "TEXT",
+        "dose_c_min": "REAL",
+        "budget_c_min": "REAL",
+    },
+}
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """为旧库补齐新版本引入的列；新库已是完整 schema，所有检查均为空操作。"""
+
+    for table, columns in _MIGRATION_COLUMNS.items():
+        existing = {
+            row["name"]
+            for row in conn.execute(f"PRAGMA table_info({table})")
+        }
+        if not existing:
+            # 表尚不存在：SCHEMA 中的 CREATE TABLE 会直接建出完整结构
+            continue
+        for name, decl in columns.items():
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+
+
 def init_db(db_path: str | None = None) -> None:
-    """创建数据目录并执行幂等建表脚本，启动时调用。"""
+    """创建数据目录并执行幂等建表脚本，启动时调用；旧库自动兼容迁移。"""
 
     path = Path(db_path or DB_PATH)
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = connect(db_path)
     try:
         conn.executescript(SCHEMA)
+        _migrate(conn)
         conn.commit()
     finally:
         conn.close()

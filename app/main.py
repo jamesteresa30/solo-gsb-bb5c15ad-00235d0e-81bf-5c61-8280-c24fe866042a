@@ -93,19 +93,43 @@ def update_sample(
 ):
     _require_sample(conn, sample_id)
     changes = payload.model_dump(exclude_unset=True)
+    if "name" in changes and changes["name"] is None:
+        # name 为显式 null 时拒绝（其余可空配置字段允许显式 null 清空）
+        raise HTTPException(status_code=422, detail="name 不能为空")
     existing = services.get_sample(conn, sample_id)
     merged = {
         "freeze_threshold_c": existing["freeze_threshold_c"],
         "thaw_threshold_c": existing["thaw_threshold_c"],
-        **{k: v for k, v in changes.items() if v is not None},
+        "min_allowed_c": existing["min_allowed_c"],
+        "max_allowed_c": existing["max_allowed_c"],
+        "cold_dose_budget_c_min": existing["cold_dose_budget_c_min"],
+        "heat_dose_budget_c_min": existing["heat_dose_budget_c_min"],
     }
+    merged.update(changes)  # 显式 null 也参与合并，用于清空边界/预算
     if merged["freeze_threshold_c"] >= merged["thaw_threshold_c"]:
         raise HTTPException(
             status_code=422,
             detail="freeze_threshold_c 必须严格小于 thaw_threshold_c",
         )
+    if (
+        merged.get("cold_dose_budget_c_min") is not None
+        and merged.get("min_allowed_c") is None
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="配置 cold_dose_budget_c_min 时必须同时提供 min_allowed_c",
+        )
+    if (
+        merged.get("heat_dose_budget_c_min") is not None
+        and merged.get("max_allowed_c") is None
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="配置 heat_dose_budget_c_min 时必须同时提供 max_allowed_c",
+        )
     services.update_sample(conn, sample_id, changes)
-    # 阈值/区间/循环上限变化后按新配置重算（告警确认状态通过 dedup_key 保留）
+    # 阈值/区间/循环上限/暴露剂量预算或积分间隔变化后按新配置重算
+    # （告警确认状态通过 dedup_key 保留）
     if any(
         k in changes
         for k in (
@@ -114,6 +138,9 @@ def update_sample(
             "min_allowed_c",
             "max_allowed_c",
             "max_freeze_thaw_cycles",
+            "cold_dose_budget_c_min",
+            "heat_dose_budget_c_min",
+            "max_integration_interval_minutes",
         )
     ):
         services.recompute(conn, sample_id)

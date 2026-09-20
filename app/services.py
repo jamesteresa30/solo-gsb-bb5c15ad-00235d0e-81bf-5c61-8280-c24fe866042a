@@ -38,8 +38,10 @@ def create_sample(conn: sqlite3.Connection, data: dict) -> sqlite3.Row:
         INSERT INTO samples (
             id, name, freeze_threshold_c, thaw_threshold_c,
             min_allowed_c, max_allowed_c, max_freeze_thaw_cycles,
+            cold_dose_budget_c_min, heat_dose_budget_c_min,
+            max_integration_interval_minutes,
             created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             sample_id,
@@ -49,6 +51,9 @@ def create_sample(conn: sqlite3.Connection, data: dict) -> sqlite3.Row:
             data.get("min_allowed_c"),
             data.get("max_allowed_c"),
             data.get("max_freeze_thaw_cycles"),
+            data.get("cold_dose_budget_c_min"),
+            data.get("heat_dose_budget_c_min"),
+            data.get("max_integration_interval_minutes"),
             now,
             now,
         ),
@@ -68,7 +73,10 @@ def list_samples(conn: sqlite3.Connection) -> list[sqlite3.Row]:
 
 
 def update_sample(conn: sqlite3.Connection, sample_id: str, changes: dict) -> Optional[sqlite3.Row]:
-    changes = {k: v for k, v in changes.items() if v is not None}
+    # changes 来自 exclude_unset：只含客户端显式提交的字段，
+    # 因此显式传入的 null 也要落库（用于清空允许边界 / 预算等可空配置）。
+    if "name" in changes and changes["name"] is None:
+        raise ValueError("name 不能为空")
     if changes:
         assignments = ", ".join(f"{k} = ?" for k in changes)
         params = [*changes.values(), utcnow_iso(), sample_id]
@@ -178,6 +186,9 @@ def _sample_config(sample: sqlite3.Row) -> engine.EngineConfig:
         min_allowed_c=sample["min_allowed_c"],
         max_allowed_c=sample["max_allowed_c"],
         max_freeze_thaw_cycles=sample["max_freeze_thaw_cycles"],
+        cold_dose_budget_c_min=sample["cold_dose_budget_c_min"],
+        heat_dose_budget_c_min=sample["heat_dose_budget_c_min"],
+        max_integration_interval_minutes=sample["max_integration_interval_minutes"],
     )
 
 
@@ -259,7 +270,8 @@ def recompute(
                     """
                     UPDATE alerts SET
                         alert_type = ?, severity = ?, event_time = ?,
-                        temperature_c = ?, cycle_index = ?, reading_id = ?, message = ?
+                        temperature_c = ?, cycle_index = ?, reading_id = ?,
+                        direction = ?, dose_c_min = ?, budget_c_min = ?, message = ?
                     WHERE dedup_key = ?
                     """,
                     (
@@ -269,6 +281,9 @@ def recompute(
                         a.temperature_c,
                         a.cycle_index,
                         a.reading_id,
+                        a.direction,
+                        a.dose_c_min,
+                        a.budget_c_min,
                         a.message,
                         key,
                     ),
@@ -278,8 +293,9 @@ def recompute(
                     """
                     INSERT INTO alerts (
                         sample_id, alert_type, severity, event_time, temperature_c,
-                        cycle_index, reading_id, message, acknowledged, dedup_key, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+                        cycle_index, reading_id, direction, dose_c_min, budget_c_min,
+                        message, acknowledged, dedup_key, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
                     """,
                     (
                         sample_id,
@@ -289,6 +305,9 @@ def recompute(
                         a.temperature_c,
                         a.cycle_index,
                         a.reading_id,
+                        a.direction,
+                        a.dose_c_min,
+                        a.budget_c_min,
                         a.message,
                         key,
                         now,
@@ -305,6 +324,9 @@ def recompute(
                 active_freeze_min_c = ?,
                 active_freeze_max_c = ?,
                 cycle_count = ?,
+                cold_dose_c_min = ?,
+                heat_dose_c_min = ?,
+                exposure_gap_minutes = ?,
                 updated_at = ?
             WHERE id = ?
             """,
@@ -314,6 +336,9 @@ def recompute(
                 derived.active_freeze_min_c,
                 derived.active_freeze_max_c,
                 derived.cycle_count,
+                derived.cold_dose_c_min,
+                derived.heat_dose_c_min,
+                derived.gap_minutes,
                 now,
                 sample_id,
             ),
@@ -411,6 +436,12 @@ def get_state(conn: sqlite3.Connection, sample_id: str) -> Optional[dict]:
         "SELECT COUNT(*) AS n FROM alerts WHERE sample_id = ? AND acknowledged = 0",
         (sample_id,),
     ).fetchone()["n"]
+
+    def _usage(dose: float, budget: Optional[float]) -> Optional[float]:
+        if budget is None or budget <= 0:
+            return None
+        return round(dose / budget, 6)
+
     return {
         "sample_id": sample["id"],
         "name": sample["name"],
@@ -419,6 +450,18 @@ def get_state(conn: sqlite3.Connection, sample_id: str) -> Optional[dict]:
         "active_freeze_event_time": sample["active_freeze_event_time"],
         "active_freeze_min_c": sample["active_freeze_min_c"],
         "active_freeze_max_c": sample["active_freeze_max_c"],
+        "cold_dose_c_min": sample["cold_dose_c_min"],
+        "heat_dose_c_min": sample["heat_dose_c_min"],
+        "exposure_gap_minutes": sample["exposure_gap_minutes"],
+        "cold_dose_budget_c_min": sample["cold_dose_budget_c_min"],
+        "heat_dose_budget_c_min": sample["heat_dose_budget_c_min"],
+        "max_integration_interval_minutes": sample["max_integration_interval_minutes"],
+        "cold_budget_usage": _usage(
+            sample["cold_dose_c_min"], sample["cold_dose_budget_c_min"]
+        ),
+        "heat_budget_usage": _usage(
+            sample["heat_dose_c_min"], sample["heat_dose_budget_c_min"]
+        ),
         "last_event_time": last["event_time"] if last else None,
         "last_temperature_c": last["temperature_c"] if last else None,
         "unacknowledged_alert_count": unacked,

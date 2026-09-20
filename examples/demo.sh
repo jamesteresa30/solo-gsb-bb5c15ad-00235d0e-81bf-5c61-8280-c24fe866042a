@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# 端到端示例：创建样本 -> 正常冻融 -> 迟到数据重排 -> 幂等去重 -> 越限/超限告警 -> 查询
+# 端到端示例：创建样本 -> 正常冻融 -> 迟到数据重排 -> 幂等去重 -> 越限/超限告警
+#           -> 暴露剂量预算告警 -> 查询
 # 用法: ./examples/demo.sh （需先在 localhost:8000 启动服务）
 set -euo pipefail
 
@@ -11,7 +12,7 @@ req() { curl -sS -X "$@"; }
 echo "== 健康检查 =="
 curl -sS "$BASE/health"; echo
 
-echo "== 创建样本 =="
+echo "== 创建样本（低温剂量预算 50°C·min / 高温 200°C·min，最大积分间隔 120 分钟）=="
 curl -sS -X POST "$BASE/samples" -H 'Content-Type: application/json' -d "{
   \"id\": \"$SID\",
   \"name\": \"新冠灭活疫苗 批次 A-2026-09\",
@@ -19,7 +20,10 @@ curl -sS -X POST "$BASE/samples" -H 'Content-Type: application/json' -d "{
   \"thaw_threshold_c\": 0,
   \"min_allowed_c\": -80,
   \"max_allowed_c\": 8,
-  \"max_freeze_thaw_cycles\": 2
+  \"max_freeze_thaw_cycles\": 2,
+  \"cold_dose_budget_c_min\": 50,
+  \"heat_dose_budget_c_min\": 200,
+  \"max_integration_interval_minutes\": 120
 }"; echo
 
 echo "== 第一批读数（完成第 1 次冻融）=="
@@ -56,7 +60,7 @@ curl -sS -X POST "$BASE/samples/$SID/readings" -H 'Content-Type: application/jso
   ]
 }'; echo
 
-echo "== 当前状态 =="
+echo "== 当前状态（含双向暴露剂量、缺口时长与预算使用率）=="
 curl -sS "$BASE/samples/$SID/state"; echo
 
 echo "== 循环列表 =="

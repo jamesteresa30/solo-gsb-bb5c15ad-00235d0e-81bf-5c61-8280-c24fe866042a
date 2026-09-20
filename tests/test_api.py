@@ -239,3 +239,285 @@ def test_patch_thresholds_triggers_recompute_and_keeps_ack(client) -> None:
 def test_sample_not_found(client) -> None:
     assert client.get("/samples/nope/state").status_code == 404
     assert client.get("/alerts/999").status_code == 404
+
+
+# ---------------- 累计温度暴露剂量 ----------------
+
+
+def test_exposure_dose_state_and_budget_alert(client) -> None:
+    _create_sample(
+        client,
+        min_allowed_c=-80,
+        max_allowed_c=8,
+        cold_dose_budget_c_min=100,
+        heat_dose_budget_c_min=1000,
+        max_integration_interval_minutes=120,
+    )
+    # -85°C 恒温 60 分钟：低温剂量 5 × 60 = 300；预算 100 在 20 分钟处跨越
+    r = _submit(
+        client,
+        "s1",
+        [
+            {"event_id": "1", "event_time": "2026-09-20T08:00:00Z", "temperature_c": -85},
+            {"event_id": "2", "event_time": "2026-09-20T09:00:00Z", "temperature_c": -85},
+        ],
+    )
+    assert r.status_code == 200
+    new_types = [a["alert_type"] for a in r.json()["new_alerts"]]
+    assert "exposure_budget_exceeded" in new_types
+
+    state = client.get("/samples/s1/state").json()
+    assert state["cold_dose_c_min"] == 300.0
+    assert state["heat_dose_c_min"] == 0.0
+    assert state["exposure_gap_minutes"] == 0.0
+    assert state["cold_dose_budget_c_min"] == 100.0
+    assert state["cold_budget_usage"] == 3.0
+    assert state["heat_budget_usage"] == 0.0
+
+    alert = next(
+        a
+        for a in client.get("/alerts?sample_id=s1").json()
+        if a["alert_type"] == "exposure_budget_exceeded"
+    )
+    assert alert["direction"] == "cold"
+    assert alert["severity"] == "critical"
+    assert alert["event_time"].startswith("2026-09-20T08:20:00")
+    assert alert["temperature_c"] == -85.0
+    assert alert["budget_c_min"] == 100.0
+
+    sample = client.get("/samples/s1").json()
+    assert sample["cold_dose_budget_c_min"] == 100.0
+    assert sample["cold_dose_c_min"] == 300.0
+
+
+def test_exposure_gap_skips_long_intervals(client) -> None:
+    _create_sample(
+        client,
+        max_allowed_c=8,
+        max_integration_interval_minutes=60,
+    )
+    _submit(
+        client,
+        "s1",
+        [
+            {"event_id": "1", "event_time": "2026-09-20T08:00:00Z", "temperature_c": 20},
+            # 间隔 61 分钟：跳过并计缺口
+            {"event_id": "2", "event_time": "2026-09-20T09:01:00Z", "temperature_c": 20},
+            # 间隔 30 分钟：正常积分（幅度 12 × 30 = 360）
+            {"event_id": "3", "event_time": "2026-09-20T09:31:00Z", "temperature_c": 20},
+        ],
+    )
+    state = client.get("/samples/s1/state").json()
+    assert state["exposure_gap_minutes"] == 61.0
+    assert state["heat_dose_c_min"] == 360.0
+
+
+def test_exposure_budget_alert_is_deduped_and_reversible(client) -> None:
+    _create_sample(client, min_allowed_c=-80, cold_dose_budget_c_min=100)
+    _submit(
+        client,
+        "s1",
+        [
+            {"event_id": "1", "event_time": "2026-09-20T08:00:00Z", "temperature_c": -85},
+            {"event_id": "2", "event_time": "2026-09-20T09:00:00Z", "temperature_c": -85},
+        ],
+    )
+    alerts_before = client.get("/alerts?sample_id=s1").json()
+    budget_alerts = [a for a in alerts_before if a["alert_type"] == "exposure_budget_exceeded"]
+    assert len(budget_alerts) == 1
+    alert_id = budget_alerts[0]["id"]
+    client.post(f"/alerts/{alert_id}/ack", json={"acknowledged": True})
+
+    # 继续追加读数触发重算：告警仍是同一条（稳定去重），确认状态保留
+    _submit(
+        client,
+        "s1",
+        [
+            {"event_id": "3", "event_time": "2026-09-20T10:00:00Z", "temperature_c": -85},
+        ],
+    )
+    alerts_after = client.get("/alerts?sample_id=s1").json()
+    budget_after = [a for a in alerts_after if a["alert_type"] == "exposure_budget_exceeded"]
+    assert len(budget_after) == 1
+    assert budget_after[0]["id"] == alert_id
+    assert budget_after[0]["acknowledged"] is True
+
+    # 预算调得足够大：重算后预算告警应被清除（可逆）
+    r = client.patch("/samples/s1", json={"cold_dose_budget_c_min": 1_000_000})
+    assert r.status_code == 200
+    assert not [
+        a
+        for a in client.get("/alerts?sample_id=s1").json()
+        if a["alert_type"] == "exposure_budget_exceeded"
+    ]
+    assert client.get("/samples/s1/state").json()["cold_budget_usage"] < 1
+
+    # 再调回小预算：告警重新出现
+    client.patch("/samples/s1", json={"cold_dose_budget_c_min": 100})
+    assert [
+        a
+        for a in client.get("/alerts?sample_id=s1").json()
+        if a["alert_type"] == "exposure_budget_exceeded"
+    ]
+
+
+def test_late_readings_recompute_exposure_dose(client) -> None:
+    _create_sample(client, max_allowed_c=8, heat_dose_budget_c_min=1_000)
+    _submit(
+        client,
+        "s1",
+        [
+            {"event_id": "1", "event_time": "2026-09-20T08:00:00Z", "temperature_c": 5},
+            {"event_id": "3", "event_time": "2026-09-20T10:00:00Z", "temperature_c": 5},
+        ],
+    )
+    before = client.get("/samples/s1/state").json()["heat_dose_c_min"]
+
+    # 迟到一个 09:00 的高温点，插值剂量随之重算
+    _submit(
+        client,
+        "s1",
+        [
+            {"event_id": "late", "event_time": "2026-09-20T09:00:00Z", "temperature_c": 20},
+        ],
+    )
+    after = client.get("/samples/s1/state").json()
+    # 两段对称三角：5 -> 20 -> 5，每段在 f=0.2 处越过 8，
+    # 正值段 48 分钟、幅度 0 -> 12：0.5 × 12 × 48 = 288，两段合计 576
+    assert after["heat_dose_c_min"] == 576.0
+    assert before != after["heat_dose_c_min"]
+
+
+def test_dose_config_validation(client) -> None:
+    # 低温预算但没有下限 -> 422
+    r = client.post(
+        "/samples",
+        json={
+            "id": "bad1",
+            "name": "x",
+            "freeze_threshold_c": -20,
+            "thaw_threshold_c": 0,
+            "cold_dose_budget_c_min": 100,
+        },
+    )
+    assert r.status_code == 422
+
+    # 预算非正 -> 422
+    r = client.post(
+        "/samples",
+        json={
+            "id": "bad2",
+            "name": "x",
+            "freeze_threshold_c": -20,
+            "thaw_threshold_c": 0,
+            "max_allowed_c": 8,
+            "heat_dose_budget_c_min": 0,
+        },
+    )
+    assert r.status_code == 422
+
+    # PATCH 合并现有配置后仍缺边界 -> 422
+    _create_sample(client, sid="s2", min_allowed_c=None, max_allowed_c=None)
+    r = client.patch("/samples/s2", json={"cold_dose_budget_c_min": 100})
+    assert r.status_code == 422
+
+    # 显式 null 清空：保留冷预算时清空下限 -> 422；先清预算再清下限 -> 200
+    _create_sample(client, sid="s3", cold_dose_budget_c_min=100)
+    r = client.patch("/samples/s3", json={"min_allowed_c": None})
+    assert r.status_code == 422
+    assert client.patch("/samples/s3", json={"cold_dose_budget_c_min": None}).status_code == 200
+    assert client.patch("/samples/s3", json={"min_allowed_c": None}).status_code == 200
+    # 未提交 name 时的普通字段更新不受影响；显式 name=null -> 422
+    assert client.patch("/samples/s3", json={"thaw_threshold_c": -5}).status_code == 200
+    assert client.patch("/samples/s3", json={"name": None}).status_code == 422
+
+
+def test_database_migration_from_legacy_schema(tmp_path, monkeypatch) -> None:
+    """旧版本数据库（无暴露剂量列）启动时应通过 ALTER TABLE 平滑升级。"""
+
+    import sqlite3
+
+    legacy = tmp_path / "legacy.db"
+    conn = sqlite3.connect(legacy)
+    conn.executescript(
+        """
+        CREATE TABLE samples (
+            id TEXT PRIMARY KEY, name TEXT NOT NULL,
+            freeze_threshold_c REAL NOT NULL, thaw_threshold_c REAL NOT NULL,
+            min_allowed_c REAL, max_allowed_c REAL, max_freeze_thaw_cycles INTEGER,
+            current_state TEXT NOT NULL DEFAULT 'thawed',
+            active_freeze_event_time TEXT, active_freeze_min_c REAL,
+            active_freeze_max_c REAL, cycle_count INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE TABLE readings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, sample_id TEXT NOT NULL,
+            event_id TEXT, event_time TEXT NOT NULL, received_at TEXT NOT NULL,
+            temperature_c REAL NOT NULL,
+            UNIQUE(sample_id, event_id),
+            UNIQUE(sample_id, event_time, temperature_c)
+        );
+        CREATE TABLE cycles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, sample_id TEXT NOT NULL,
+            cycle_index INTEGER NOT NULL, freeze_event_time TEXT NOT NULL,
+            freeze_temperature_c REAL NOT NULL, thaw_event_time TEXT NOT NULL,
+            thaw_temperature_c REAL NOT NULL, min_temperature_c REAL NOT NULL,
+            max_temperature_c REAL NOT NULL, UNIQUE(sample_id, cycle_index)
+        );
+        CREATE TABLE alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, sample_id TEXT NOT NULL,
+            alert_type TEXT NOT NULL, severity TEXT NOT NULL, event_time TEXT NOT NULL,
+            temperature_c REAL, cycle_index INTEGER, reading_id INTEGER,
+            message TEXT NOT NULL, acknowledged INTEGER NOT NULL DEFAULT 0,
+            dedup_key TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL
+        );
+        INSERT INTO samples VALUES (
+            'legacy-1', '旧库样本', -20, 0, -80, 8, 2,
+            'thawed', NULL, NULL, NULL, 0, '2026-01-01T00:00:00+00:00',
+            '2026-01-01T00:00:00+00:00'
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setenv("DB_PATH", str(legacy))
+
+    import app.database as database
+    import app.services as services
+    import app.main as main
+
+    importlib.reload(database)
+    importlib.reload(services)
+    importlib.reload(main)
+    database.init_db()
+
+    from fastapi.testclient import TestClient
+
+    with TestClient(main.app) as c:
+        # 旧样本仍可查询，新列有默认值
+        state = c.get("/samples/legacy-1/state").json()
+        assert state["cold_dose_c_min"] == 0.0
+        assert state["heat_dose_c_min"] == 0.0
+        assert state["exposure_gap_minutes"] == 0.0
+        assert state["cold_budget_usage"] is None
+
+        # 旧样本可 PATCH 预算并正常重算
+        r = c.patch("/samples/legacy-1", json={"cold_dose_budget_c_min": 100})
+        assert r.status_code == 200
+        r = c.post(
+            "/samples/legacy-1/readings",
+            json={
+                "readings": [
+                    {"event_id": "x1", "event_time": "2026-09-20T08:00:00Z", "temperature_c": -85},
+                    {"event_id": "x2", "event_time": "2026-09-20T09:00:00Z", "temperature_c": -85},
+                ]
+            },
+        )
+        assert r.status_code == 200
+        state = c.get("/samples/legacy-1/state").json()
+        assert state["cold_dose_c_min"] == 300.0
+        assert any(
+            a["alert_type"] == "exposure_budget_exceeded"
+            for a in c.get("/alerts?sample_id=legacy-1").json()
+        )
