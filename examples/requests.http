@@ -1,0 +1,93 @@
+# 实验室样本冻融追踪 API 示例请求
+# VS Code REST Client / IntelliJ HTTP Client 可直接执行；curl 版本见 README。
+
+@baseUrl = http://localhost:8000
+@sampleId = sample-demo-001
+
+### 健康检查
+GET {{baseUrl}}/health
+
+### 1. 创建样本（冻结阈值 -20°C / 解冻阈值 0°C，允许区间 [-80, 8]，最多 2 次循环）
+POST {{baseUrl}}/samples
+Content-Type: application/json
+
+{
+  "id": "sample-demo-001",
+  "name": "新冠灭活疫苗 批次 A-2026-09",
+  "freeze_threshold_c": -20,
+  "thaw_threshold_c": 0,
+  "min_allowed_c": -80,
+  "max_allowed_c": 8,
+  "max_freeze_thaw_cycles": 2
+}
+
+### 2. 提交一批正常时间顺序的读数（第 1 次冻 + 融）
+POST {{baseUrl}}/samples/{{sampleId}}/readings
+Content-Type: application/json
+
+{
+  "readings": [
+    {"event_id": "evt-001", "event_time": "2026-09-20T08:00:00Z", "temperature_c": 4.0},
+    {"event_id": "evt-002", "event_time": "2026-09-20T08:15:00Z", "temperature_c": -5.0},
+    {"event_id": "evt-003", "event_time": "2026-09-20T08:30:00Z", "temperature_c": -22.0},
+    {"event_id": "evt-004", "event_time": "2026-09-20T10:00:00Z", "temperature_c": -10.0},
+    {"event_id": "evt-005", "event_time": "2026-09-20T10:30:00Z", "temperature_c": 2.0}
+  ]
+}
+
+### 3. 迟到数据：补传一段“更早发生”的读数（09:00 解冻、09:30 再冻；
+###    与原有 10:00 -10°C（滞回区保持冻结）、10:30 解冻重排后，多出一次完整循环）
+POST {{baseUrl}}/samples/{{sampleId}}/readings
+Content-Type: application/json
+
+{
+  "readings": [
+    {"event_id": "evt-late-1", "event_time": "2026-09-20T09:00:00Z", "temperature_c": 3.0},
+    {"event_id": "evt-late-2", "event_time": "2026-09-20T09:30:00Z", "temperature_c": -25.0}
+  ]
+}
+
+### 4. 重复提交（event_id 与上一批重复 -> 全部幂等跳过）
+POST {{baseUrl}}/samples/{{sampleId}}/readings
+Content-Type: application/json
+
+{
+  "readings": [
+    {"event_id": "evt-003", "event_time": "2026-09-20T08:30:00Z", "temperature_c": -22.0}
+  ]
+}
+
+### 5. 越限温度 + 第 3 次循环超限告警
+POST {{baseUrl}}/samples/{{sampleId}}/readings
+Content-Type: application/json
+
+{
+  "readings": [
+    {"event_id": "evt-006", "event_time": "2026-09-20T11:00:00Z", "temperature_c": -85.5},
+    {"event_id": "evt-007", "event_time": "2026-09-20T11:30:00Z", "temperature_c": 5.0}
+  ]
+}
+
+### 6. 查询当前状态（当前状态 / 循环次数 / 未确认告警数）
+GET {{baseUrl}}/samples/{{sampleId}}/state
+
+### 7. 查询识别出的完整冻融循环（按时间顺序）
+GET {{baseUrl}}/samples/{{sampleId}}/cycles
+
+### 8. 查询全部读数（已按 event_time 重排）
+GET {{baseUrl}}/samples/{{sampleId}}/readings
+
+### 9. 查询该样本所有告警
+GET {{baseUrl}}/alerts?sample_id={{sampleId}}
+
+### 10. 查询全局未确认告警
+GET {{baseUrl}}/alerts?acknowledged=false
+
+### 11. 确认该样本全部告警
+POST {{baseUrl}}/samples/{{sampleId}}/alerts/ack
+Content-Type: application/json
+
+{"acknowledged": true}
+
+### 12. 手动重算（通常无需调用，提交读数后自动完成）
+POST {{baseUrl}}/samples/{{sampleId}}/recompute
