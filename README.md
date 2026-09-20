@@ -7,7 +7,10 @@
 - 使用可配置的**冻结/解冻阈值 + 滞回（Schmitt 触发器）**规则识别完整冻融循环，避免临界温度抖动造成的误判；
 - 重复事件通过客户端 `event_id`（或“同时刻同温度”签名）**幂等去重**；
 - 暴露样本**当前状态、完整循环次数/明细、温度越限与循环超限告警**查询与确认接口；
-- 容器启动即自动初始化数据库（建表、索引）。
+- 支持**累计温度暴露剂量（°C·分钟）**：按相邻读数线性插值积分越限幅度，
+  超低温/超高温双向预算首次跨越时产生稳定去重的 `exposure_budget_exceeded` 告警，
+  间隔过大的数据缺口跳过积分并单独统计；
+- 容器启动即自动初始化数据库（建表、索引、旧版本库兼容迁移）。
 
 ## 目录结构
 
@@ -26,17 +29,20 @@ docker-compose.yml
 
 ## 快速开始（Docker）
 
+一键启动（自动构建镜像、初始化/迁移数据库）：
+
 ```bash
 docker compose up --build
 ```
 
-服务监听 http://localhost:8000 ：
+启动后服务监听 **http://localhost:8000** ：
 
 - Swagger 文档：http://localhost:8000/docs
 - ReDoc：http://localhost:8000/redoc
 - 健康检查：http://localhost:8000/health
 
-SQLite 数据文件持久化在 named volume `freeze-thaw-data`（容器内 `/data/freeze_thaw.db`），首次启动自动建库。
+SQLite 数据文件持久化在 named volume `freeze-thaw-data`（容器内 `/data/freeze_thaw.db`），
+首次启动自动建库；升级到含暴露剂量字段的新版本时会对旧库执行幂等 `ALTER TABLE` 兼容迁移，历史数据保留。
 
 ## 本地开发
 
@@ -70,16 +76,38 @@ pytest -q
 1. **`temperature_excursion`（critical）**：读数超出样本允许区间
    `[min_allowed_c, max_allowed_c]`。连续越限只告警一次（去抖），回到区间后再次越限才再次告警。
 2. **`cycle_limit_exceeded`（warning）**：完整循环次数超过 `max_freeze_thaw_cycles`，每超出一次循环告警一次。
+3. **`exposure_budget_exceeded`（warning）**：累计温度暴露剂量首次达到预算（低温/高温各最多一条，
+   字段 `exposure_side = low/high`）。剂量、缺口与该告警同样由重算驱动，迟到数据或配置
+   收紧/放宽后可双向更新：不再成立的告警会被撤销，重新成立时按稳定去重键恢复（含确认状态）。
 
 告警支持单条确认、按样本批量确认；重算会保留确认状态（按稳定去重键 upsert）。
+
+## 累计温度暴露剂量
+
+对按 `event_time` 排序后的**相邻读数做线性插值**，把温度曲线在允许区间之外的区段切分积分，
+单位 **°C·分钟（超限幅度 × 分钟）**：
+
+- **超低温剂量** `low_exposure_c_min` = 低于 `min_allowed_c` 的幅度对分钟的积分；
+- **超高温剂量** `high_exposure_c_min` = 高于 `max_allowed_c` 的幅度对分钟的积分；
+- 两读数间隔超过 `max_integration_gap_minutes` 时该段**不积分**（视为数据缺口），
+  间隔时长累计到 `exposure_gap_minutes`；未配置该参数则不设上限；
+- 阈值穿越点通过线性插值确定，越限段为三角形/梯形面积，无需读数恰好落在阈值上；
+- 预算 `low_exposure_budget_c_min` / `high_exposure_budget_c_min`（°C·分钟）被首次跨越时
+  产生告警，跨越时间按段内剂量线性插值估计。
+
+状态接口 `GET /samples/{id}/state` 同时返回双向剂量、缺口时长与两侧预算使用率
+（`low/high_exposure_budget_used_ratio`，未配置预算侧为 `null`）。
 
 ## 迟到数据与重算
 
 每次成功写入新读数后，服务都会：
 
 1. 取出该样本**全部**读数，按 `(event_time, id)` 升序重排（迟到数据自然回到正确时间位置）；
-2. 用 `engine.derive` 纯函数重放状态机，重建完整循环与告警；
-3. 刷新样本当前状态缓存。
+2. 用 `engine.derive` 纯函数重放状态机，重建完整循环、**累计双向暴露剂量/缺口**与告警；
+3. 刷新样本当前状态缓存（含剂量缓存）。
+
+阈值、允许区间、循环上限或剂量预算/积分间隔发生 PATCH 变更时也会走同一重算流程，
+因此剂量与告警（含确认状态）始终与最新读数和配置保持一致，更新完全可逆。
 
 也可调用 `POST /samples/{id}/recompute` 手动触发兜底重算。
 
@@ -101,7 +129,7 @@ pytest -q
 | GET/PATCH/DELETE | `/samples/{id}` | 样本详情 / 修改配置（自动重算） / 删除 |
 | POST | `/samples/{id}/readings` | 批量提交读数（幂等，提交后自动重算，返回新告警） |
 | GET | `/samples/{id}/readings` | 读数列表（按事件时间排序） |
-| GET | `/samples/{id}/state` | **当前状态**、循环次数、未确认告警数、最近读数 |
+| GET | `/samples/{id}/state` | **当前状态**、循环次数、双向剂量/缺口/预算使用率、未确认告警数、最近读数 |
 | GET | `/samples/{id}/cycles` | **完整冻融循环明细** |
 | POST | `/samples/{id}/recompute` | 手动重算 |
 | GET | `/alerts` | **告警查询**（可按样本、确认状态过滤，分页） |
@@ -121,7 +149,10 @@ curl -X POST http://localhost:8000/samples \
     "thaw_threshold_c": 0,
     "min_allowed_c": -80,
     "max_allowed_c": 8,
-    "max_freeze_thaw_cycles": 2
+    "max_freeze_thaw_cycles": 2,
+    "low_exposure_budget_c_min": 2000,
+    "high_exposure_budget_c_min": 500,
+    "max_integration_gap_minutes": 180
   }'
 
 # 2. 提交读数（完成一次冻融）
@@ -173,7 +204,9 @@ chmod +x examples/demo.sh && ./examples/demo.sh
 | `DB_PATH` | 本地 `data/freeze_thaw.db`；镜像内 `/data/freeze_thaw.db` | SQLite 文件路径，启动自动建库 |
 
 样本级配置（创建时指定，可 PATCH 修改）：`freeze_threshold_c`、`thaw_threshold_c`、
-`min_allowed_c`、`max_allowed_c`、`max_freeze_thaw_cycles`。
+`min_allowed_c`、`max_allowed_c`、`max_freeze_thaw_cycles`，以及暴露剂量相关的
+`low_exposure_budget_c_min`、`high_exposure_budget_c_min`（°C·分钟预算，正数）、
+`max_integration_gap_minutes`（相邻读数最大可积分间隔，分钟，正数）。
 
 ## 测试
 
@@ -182,4 +215,6 @@ pytest -q
 ```
 
 覆盖内容：阈值边界与滞回、死区防抖、不完整冻结不计循环、温度越限去抖告警、
-循环超限告警、迟到数据重排、`event_id`/签名双重幂等、告警确认在重算后保留、404 处理。
+循环超限告警、暴露剂量线性插值/阈值穿越切分/缺口跳过/双向预算首次跨越与稳定去重、
+迟到数据重排后剂量与告警可逆更新、预算 PATCH 触发重算、旧版数据库 ALTER 兼容迁移、
+`event_id`/签名双重幂等、告警确认在重算后保留、404 处理。

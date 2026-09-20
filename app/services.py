@@ -38,8 +38,10 @@ def create_sample(conn: sqlite3.Connection, data: dict) -> sqlite3.Row:
         INSERT INTO samples (
             id, name, freeze_threshold_c, thaw_threshold_c,
             min_allowed_c, max_allowed_c, max_freeze_thaw_cycles,
+            low_exposure_budget_c_min, high_exposure_budget_c_min,
+            max_integration_gap_minutes,
             created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             sample_id,
@@ -49,6 +51,9 @@ def create_sample(conn: sqlite3.Connection, data: dict) -> sqlite3.Row:
             data.get("min_allowed_c"),
             data.get("max_allowed_c"),
             data.get("max_freeze_thaw_cycles"),
+            data.get("low_exposure_budget_c_min"),
+            data.get("high_exposure_budget_c_min"),
+            data.get("max_integration_gap_minutes"),
             now,
             now,
         ),
@@ -178,6 +183,9 @@ def _sample_config(sample: sqlite3.Row) -> engine.EngineConfig:
         min_allowed_c=sample["min_allowed_c"],
         max_allowed_c=sample["max_allowed_c"],
         max_freeze_thaw_cycles=sample["max_freeze_thaw_cycles"],
+        low_exposure_budget_c_min=sample["low_exposure_budget_c_min"],
+        high_exposure_budget_c_min=sample["high_exposure_budget_c_min"],
+        max_integration_gap_minutes=sample["max_integration_gap_minutes"],
     )
 
 
@@ -259,7 +267,9 @@ def recompute(
                     """
                     UPDATE alerts SET
                         alert_type = ?, severity = ?, event_time = ?,
-                        temperature_c = ?, cycle_index = ?, reading_id = ?, message = ?
+                        temperature_c = ?, cycle_index = ?, reading_id = ?,
+                        exposure_side = ?, exposure_c_min = ?,
+                        exposure_budget_c_min = ?, message = ?
                     WHERE dedup_key = ?
                     """,
                     (
@@ -269,6 +279,9 @@ def recompute(
                         a.temperature_c,
                         a.cycle_index,
                         a.reading_id,
+                        a.exposure_side,
+                        a.exposure_c_min,
+                        a.exposure_budget_c_min,
                         a.message,
                         key,
                     ),
@@ -278,8 +291,9 @@ def recompute(
                     """
                     INSERT INTO alerts (
                         sample_id, alert_type, severity, event_time, temperature_c,
-                        cycle_index, reading_id, message, acknowledged, dedup_key, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+                        cycle_index, reading_id, exposure_side, exposure_c_min,
+                        exposure_budget_c_min, message, acknowledged, dedup_key, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
                     """,
                     (
                         sample_id,
@@ -289,6 +303,9 @@ def recompute(
                         a.temperature_c,
                         a.cycle_index,
                         a.reading_id,
+                        a.exposure_side,
+                        a.exposure_c_min,
+                        a.exposure_budget_c_min,
                         a.message,
                         key,
                         now,
@@ -305,6 +322,9 @@ def recompute(
                 active_freeze_min_c = ?,
                 active_freeze_max_c = ?,
                 cycle_count = ?,
+                low_exposure_c_min = ?,
+                high_exposure_c_min = ?,
+                exposure_gap_minutes = ?,
                 updated_at = ?
             WHERE id = ?
             """,
@@ -314,6 +334,9 @@ def recompute(
                 derived.active_freeze_min_c,
                 derived.active_freeze_max_c,
                 derived.cycle_count,
+                derived.low_exposure_c_min,
+                derived.high_exposure_c_min,
+                derived.exposure_gap_minutes,
                 now,
                 sample_id,
             ),
@@ -411,6 +434,13 @@ def get_state(conn: sqlite3.Connection, sample_id: str) -> Optional[dict]:
         "SELECT COUNT(*) AS n FROM alerts WHERE sample_id = ? AND acknowledged = 0",
         (sample_id,),
     ).fetchone()["n"]
+    def _used_ratio(dose: Optional[float], budget: Optional[float]) -> Optional[float]:
+        if budget is None:
+            return None
+        if budget <= 0:
+            return None
+        return float(dose or 0.0) / float(budget)
+
     return {
         "sample_id": sample["id"],
         "name": sample["name"],
@@ -421,6 +451,17 @@ def get_state(conn: sqlite3.Connection, sample_id: str) -> Optional[dict]:
         "active_freeze_max_c": sample["active_freeze_max_c"],
         "last_event_time": last["event_time"] if last else None,
         "last_temperature_c": last["temperature_c"] if last else None,
+        "low_exposure_c_min": sample["low_exposure_c_min"],
+        "high_exposure_c_min": sample["high_exposure_c_min"],
+        "exposure_gap_minutes": sample["exposure_gap_minutes"],
+        "low_exposure_budget_c_min": sample["low_exposure_budget_c_min"],
+        "high_exposure_budget_c_min": sample["high_exposure_budget_c_min"],
+        "low_exposure_budget_used_ratio": _used_ratio(
+            sample["low_exposure_c_min"], sample["low_exposure_budget_c_min"]
+        ),
+        "high_exposure_budget_used_ratio": _used_ratio(
+            sample["high_exposure_c_min"], sample["high_exposure_budget_c_min"]
+        ),
         "unacknowledged_alert_count": unacked,
     }
 

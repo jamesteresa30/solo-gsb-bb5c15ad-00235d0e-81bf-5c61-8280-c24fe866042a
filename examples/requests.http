@@ -7,7 +7,8 @@
 ### 健康检查
 GET {{baseUrl}}/health
 
-### 1. 创建样本（冻结阈值 -20°C / 解冻阈值 0°C，允许区间 [-80, 8]，最多 2 次循环）
+### 1. 创建样本（冻结阈值 -20°C / 解冻阈值 0°C，允许区间 [-80, 8]，最多 2 次循环，
+###    超低温剂量预算 5000°C·分钟 / 超高温 100°C·分钟，最大积分间隔 180 分钟）
 POST {{baseUrl}}/samples
 Content-Type: application/json
 
@@ -18,7 +19,10 @@ Content-Type: application/json
   "thaw_threshold_c": 0,
   "min_allowed_c": -80,
   "max_allowed_c": 8,
-  "max_freeze_thaw_cycles": 2
+  "max_freeze_thaw_cycles": 2,
+  "low_exposure_budget_c_min": 5000,
+  "high_exposure_budget_c_min": 100,
+  "max_integration_gap_minutes": 180
 }
 
 ### 2. 提交一批正常时间顺序的读数（第 1 次冻 + 融）

@@ -19,7 +19,10 @@ curl -sS -X POST "$BASE/samples" -H 'Content-Type: application/json' -d "{
   \"thaw_threshold_c\": 0,
   \"min_allowed_c\": -80,
   \"max_allowed_c\": 8,
-  \"max_freeze_thaw_cycles\": 2
+  \"max_freeze_thaw_cycles\": 2,
+  \"low_exposure_budget_c_min\": 5000,
+  \"high_exposure_budget_c_min\": 100,
+  \"max_integration_gap_minutes\": 180
 }"; echo
 
 echo "== 第一批读数（完成第 1 次冻融）=="

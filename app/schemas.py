@@ -27,9 +27,24 @@ class SampleCreate(BaseModel):
     min_allowed_c: Optional[float] = Field(None, description="允许的最低温度，低于即告警")
     max_allowed_c: Optional[float] = Field(None, description="允许的最高温度，高于即告警")
     max_freeze_thaw_cycles: Optional[int] = Field(None, ge=0, description="允许的最大冻融循环次数")
+    low_exposure_budget_c_min: Optional[float] = Field(
+        None,
+        gt=0,
+        description="超低温（低于 min_allowed_c）累计暴露剂量预算，单位 °C·分钟",
+    )
+    high_exposure_budget_c_min: Optional[float] = Field(
+        None,
+        gt=0,
+        description="超高温（高于 max_allowed_c）累计暴露剂量预算，单位 °C·分钟",
+    )
+    max_integration_gap_minutes: Optional[float] = Field(
+        None,
+        gt=0,
+        description="相邻读数可积分的最大间隔（分钟）；超过则跳过该段并计入缺口",
+    )
 
     @model_validator(mode="after")
-    def _validate(self):
+    def _validate_create(self):
         if self.freeze_threshold_c >= self.thaw_threshold_c:
             raise ValueError("freeze_threshold_c 必须严格小于 thaw_threshold_c")
         return self
@@ -42,6 +57,9 @@ class SampleUpdate(BaseModel):
     min_allowed_c: Optional[float] = None
     max_allowed_c: Optional[float] = None
     max_freeze_thaw_cycles: Optional[int] = Field(None, ge=0)
+    low_exposure_budget_c_min: Optional[float] = Field(None, gt=0)
+    high_exposure_budget_c_min: Optional[float] = Field(None, gt=0)
+    max_integration_gap_minutes: Optional[float] = Field(None, gt=0)
 
     @model_validator(mode="after")
     def _validate(self):
@@ -80,11 +98,17 @@ class SampleOut(BaseModel):
     min_allowed_c: Optional[float]
     max_allowed_c: Optional[float]
     max_freeze_thaw_cycles: Optional[int]
+    low_exposure_budget_c_min: Optional[float]
+    high_exposure_budget_c_min: Optional[float]
+    max_integration_gap_minutes: Optional[float]
     current_state: str
     active_freeze_event_time: Optional[datetime]
     active_freeze_min_c: Optional[float]
     active_freeze_max_c: Optional[float]
     cycle_count: int
+    low_exposure_c_min: float
+    high_exposure_c_min: float
+    exposure_gap_minutes: float
     created_at: datetime
     updated_at: datetime
 
@@ -123,6 +147,9 @@ class AlertOut(BaseModel):
     temperature_c: Optional[float]
     cycle_index: Optional[int]
     reading_id: Optional[int]
+    exposure_side: Optional[str]
+    exposure_c_min: Optional[float]
+    exposure_budget_c_min: Optional[float]
     message: str
     acknowledged: bool
     created_at: datetime
@@ -138,6 +165,15 @@ class SampleStateOut(BaseModel):
     active_freeze_max_c: Optional[float]
     last_event_time: Optional[datetime]
     last_temperature_c: Optional[float]
+    # 双向累计暴露剂量（°C·分钟）与因间隔超限未积分的缺口时长（分钟）
+    low_exposure_c_min: float
+    high_exposure_c_min: float
+    exposure_gap_minutes: float
+    low_exposure_budget_c_min: Optional[float]
+    high_exposure_budget_c_min: Optional[float]
+    # 预算使用率（累计剂量 / 预算）；未配置预算侧为 None
+    low_exposure_budget_used_ratio: Optional[float]
+    high_exposure_budget_used_ratio: Optional[float]
     unacknowledged_alert_count: int
 
 

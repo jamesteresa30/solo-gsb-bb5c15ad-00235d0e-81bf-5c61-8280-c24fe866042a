@@ -38,7 +38,8 @@ app = FastAPI(
     description=(
         "接收带事件时间的样本温度读数，按时间顺序重排迟到数据，"
         "以可配置的冻结/解冻阈值和滞回规则识别完整冻融循环，"
-        "提供幂等去重、当前状态、循环次数与超限告警查询。"
+        "并按线性插值累计超低温/超高温暴露剂量（°C·分钟）与缺口时长，"
+        "提供幂等去重、当前状态、循环次数、预算使用率与超限告警查询。"
     ),
     version=__version__,
     lifespan=lifespan,
@@ -105,7 +106,7 @@ def update_sample(
             detail="freeze_threshold_c 必须严格小于 thaw_threshold_c",
         )
     services.update_sample(conn, sample_id, changes)
-    # 阈值/区间/循环上限变化后按新配置重算（告警确认状态通过 dedup_key 保留）
+    # 阈值/区间/循环上限/暴露预算变化后按新配置重算（告警确认状态通过 dedup_key 保留）
     if any(
         k in changes
         for k in (
@@ -114,6 +115,9 @@ def update_sample(
             "min_allowed_c",
             "max_allowed_c",
             "max_freeze_thaw_cycles",
+            "low_exposure_budget_c_min",
+            "high_exposure_budget_c_min",
+            "max_integration_gap_minutes",
         )
     ):
         services.recompute(conn, sample_id)
